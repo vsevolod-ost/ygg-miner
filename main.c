@@ -37,10 +37,18 @@ int get_leading_zero_bits(public_key_t* key)
 
 void keytoaddr(struct in6_addr* addr, public_key_t* key, int key_height)
 {
-    /* Invert key */
-    public_key_t key_inverted;
-    for (size_t i = 0; i < sizeof(public_key_t); ++i)
-        key_inverted.as_bytes[i] = ~key->as_bytes[i];
+#define U64_IN_PK sizeof(public_key_t) / sizeof(uint64_t)
+    static_assert(sizeof(public_key_t) % sizeof(uint64_t) == 0, "");
+    union {
+        public_key_t as_key;
+        uint64_t as_ints[U64_IN_PK];
+        uint8_t as_bytes[sizeof(public_key_t)];
+    } inv_key;
+    inv_key.as_key = *key;
+
+    for (size_t i = 0; i < U64_IN_PK; ++i)
+        inv_key.as_ints[i] = ~inv_key.as_ints[i];
+#undef U64_IN_PK
 
     int total_bit_offset = key_height + 1;
     int byte_offset = total_bit_offset / 8;
@@ -50,15 +58,28 @@ void keytoaddr(struct in6_addr* addr, public_key_t* key, int key_height)
     addr_bytes[0] = 2;
     addr_bytes[1] = key_height;
     for (size_t i = 2; i < sizeof(struct in6_addr); ++i) {
-        struct
-        {
-            uint8_t next_byte;
-            uint8_t cur_byte;
-        } two_bytes = { key->as_bytes[i - 2 + byte_offset + 1], key->as_bytes[i - 2 + byte_offset + 1] };
-
-        // uint16_t* two_bytes = (uint16_t*)&key->as_bytes[i - 2 + byte_offset];
-        addr_bytes[i] = (*(uint16_t*)&two_bytes) << bit_offset >> 8;
+        uint8_t cur_byte = inv_key.as_bytes[byte_offset],
+                next_byte = inv_key.as_bytes[byte_offset + 1];
+        addr_bytes[i] = (cur_byte << bit_offset) | (next_byte >> (8 - bit_offset));
+        ++byte_offset;
     }
+}
+
+void print_key_info(keypair_t* keypair, int height)
+{
+    /* IP address */
+    struct in6_addr addr;
+    keytoaddr(&addr, &keypair->pk, height);
+    char addr_s[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &addr, addr_s, sizeof addr_s);
+
+    printf("# IPv6 address: %s\n", addr_s);
+
+    /* Private key */
+    char secret_key_hex[sizeof(secret_key_t) * 2 + 1];
+    sodium_bin2hex(secret_key_hex, sizeof secret_key_hex, keypair->sk.as_bytes, sizeof(secret_key_t));
+
+    printf("PrivateKey: %s\n", secret_key_hex);
 }
 
 int main(void)
@@ -82,12 +103,7 @@ int main(void)
         /* Save result if it is the best one */
         for (int_fast16_t best_height_copy; height > (best_height_copy = best_height);) {
             if (atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
-                struct in6_addr addr;
-                keytoaddr(&addr, &keypair.pk, height);
-                char addr_s[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET6, &addr, addr_s, sizeof addr_s);
-                printf("Address: %s\n", addr_s);
-                /* TODO: print private key */
+                print_key_info(&keypair, height);
                 break;
             }
         }
