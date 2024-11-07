@@ -92,18 +92,17 @@ void print_key_info(keypair_t* keypair, int height)
 
 int main(int argc, char* argv[])
 {
-    bool option_print_all = false;
-
-    for (int opt; (opt = getopt(argc, argv, "a")) != -1;) {
-        if (opt == 'a')
-            option_print_all = true;
+    if (sodium_init() < 0) {
+        perror("Sodium library couldn't be initialized\n");
+        return 1;
     }
 
     signal(SIGINT, handle_sigint);
 
-    if (sodium_init() < 0) {
-        perror("Sodium library couldn't be initialized\n");
-        return 1;
+    bool option_print_all = false;
+    for (int opt; (opt = getopt(argc, argv, "a")) != -1;) {
+        if (opt == 'a')
+            option_print_all = true;
     }
 
 #if MEASURE_SPEED
