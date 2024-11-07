@@ -15,15 +15,9 @@
 #include "config.h"
 #include "types.h"
 
-void handle_sigint(int sig)
-{
-    exit(0);
-}
+void handle_sigint(int sig) { exit(0); }
 
-void gen_keypair(keypair_t* keypair)
-{
-    crypto_sign_ed25519_keypair(keypair->pk.as_bytes, keypair->sk.as_bytes);
-}
+void gen_keypair(keypair_t* keypair) { crypto_sign_ed25519_keypair(keypair->pk.as_bytes, keypair->sk.as_bytes); }
 
 int get_leading_zero_bits(public_key_t* key)
 {
@@ -68,8 +62,7 @@ void keytoaddr(struct in6_addr* addr, public_key_t* key, int key_height)
     addr_bytes[0] = 2;
     addr_bytes[1] = key_height;
     for (size_t i = 2; i < sizeof(struct in6_addr); ++i) {
-        uint8_t cur_byte = inv_key.as_bytes[byte_offset],
-                next_byte = inv_key.as_bytes[byte_offset + 1];
+        uint8_t cur_byte = inv_key.as_bytes[byte_offset], next_byte = inv_key.as_bytes[byte_offset + 1];
         addr_bytes[i] = (cur_byte << bit_offset) | (next_byte >> (8 - bit_offset));
         ++byte_offset;
     }
@@ -105,15 +98,16 @@ int main(int argc, char* argv[])
             option_print_all = true;
     }
 
+    typedef _Atomic(time_t) atomic_time_t;
 #if MEASURE_SPEED
     atomic_uint_fast64_t counter = 0;
-    typedef _Atomic(time_t) atomic_time_t;
     struct {
         atomic_time_t time;
         uint64_t count;
     } progress = { time(NULL), counter };
 #endif /* MEASURE_SPEED */
 
+    atomic_time_t last_flush_time = 0;
     atomic_int_fast16_t best_height = -1;
 
 #pragma omp parallel for
@@ -135,6 +129,13 @@ int main(int argc, char* argv[])
                     break;
                 }
             }
+        }
+
+        {
+            time_t now = time(NULL), last_flush_time_copy = last_flush_time;
+            if (now - last_flush_time_copy >= 5
+                && atomic_compare_exchange_weak(&last_flush_time, &last_flush_time_copy, now))
+                fflush(stdout);
         }
 
 #if MEASURE_SPEED
