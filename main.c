@@ -73,13 +73,11 @@ void print_key_info(keypair_t* keypair, int height)
     char addr_s[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &addr, addr_s, sizeof addr_s);
 
-    printf("# IPv6 address: %s\n", addr_s);
-
     /* Private key */
     char secret_key_hex[sizeof(secret_key_t) * 2 + 1];
     sodium_bin2hex(secret_key_hex, sizeof secret_key_hex, keypair->sk.as_bytes, sizeof(secret_key_t));
 
-    printf("PrivateKey: %s\n", secret_key_hex);
+    printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, secret_key_hex);
 }
 
 int main(void)
