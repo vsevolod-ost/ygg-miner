@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <bits/getopt_core.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -12,6 +14,11 @@
 
 #include "config.h"
 #include "types.h"
+
+void handle_sigint(int sig)
+{
+    exit(0);
+}
 
 void gen_keypair(keypair_t* keypair)
 {
@@ -83,8 +90,17 @@ void print_key_info(keypair_t* keypair, int height)
     printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, secret_key_hex);
 }
 
-int main(void)
+int main(int argc, char* argv[])
 {
+    bool option_print_all = false;
+
+    for (int opt; (opt = getopt(argc, argv, "a")) != -1;) {
+        if (opt == 'a')
+            option_print_all = true;
+    }
+
+    signal(SIGINT, handle_sigint);
+
     if (sodium_init() < 0) {
         perror("Sodium library couldn't be initialized\n");
         return 1;
@@ -111,10 +127,14 @@ int main(void)
         const int height = get_leading_zero_bits(&keypair.pk);
 
         /* Print result if it is the best one */
-        for (int_fast16_t best_height_copy; height > (best_height_copy = best_height);) {
-            if (atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
-                print_key_info(&keypair, height);
-                break;
+        if (option_print_all)
+            print_key_info(&keypair, height);
+        else {
+            for (int_fast16_t best_height_copy; height > (best_height_copy = best_height);) {
+                if (atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
+                    print_key_info(&keypair, height);
+                    break;
+                }
             }
         }
 
@@ -127,7 +147,7 @@ int main(void)
             uint64_t count_delta = counter_copy - progress.count;
 
             int speed = round((double)count_delta / (double)time_delta / 1000.);
-            printf("Speed = %dK keys per second\n", speed);
+            fprintf(stderr, "Speed: %dK keys per second\n", speed);
 
             progress.count = counter_copy;
         }
