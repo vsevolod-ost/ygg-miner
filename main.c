@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -12,6 +13,11 @@
 
 #include "config.h"
 #include "types.h"
+
+void handle_sigint(int sig)
+{
+    exit(0);
+}
 
 void gen_keypair(keypair_t* keypair)
 {
@@ -89,6 +95,8 @@ int main(void)
         perror("Sodium library couldn't be initialized\n");
         return 1;
     }
+
+    signal(SIGINT, handle_sigint);
 
 #if MEASURE_SPEED
     atomic_uint_fast64_t counter = 0;
