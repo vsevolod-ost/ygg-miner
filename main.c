@@ -1,13 +1,16 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <time.h>
 
 #include <omp.h>
 #include <sodium.h>
 
+#include "config.h"
 #include "types.h"
 
 void gen_keypair(keypair_t* keypair)
@@ -87,23 +90,49 @@ int main(void)
         return 1;
     }
 
+#if MEASURE_SPEED
+    atomic_uint_fast64_t counter = 0;
+    typedef _Atomic(time_t) atomic_time_t;
+    struct {
+        atomic_time_t time;
+        uint64_t count;
+    } progress = { time(NULL), counter };
+#endif /* MEASURE_SPEED */
+
     atomic_int_fast16_t best_height = -1;
 
 #pragma omp parallel for
-    for (uint64_t counter = 0; counter < UINT64_MAX; ++counter) {
+    for (uint64_t __i = 0; __i < UINT64_MAX; ++__i) {
         /* Generate keypair*/
         keypair_t keypair;
         gen_keypair(&keypair);
 
         /* Count address height*/
-        int height = get_leading_zero_bits(&keypair.pk);
+        const int height = get_leading_zero_bits(&keypair.pk);
 
-        /* Save result if it is the best one */
+        /* Print result if it is the best one */
         for (int_fast16_t best_height_copy; height > (best_height_copy = best_height);) {
             if (atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
                 print_key_info(&keypair, height);
                 break;
             }
         }
+
+#if MEASURE_SPEED
+        time_t now = time(NULL),
+               progress_time_copy = progress.time,
+               time_delta = now - progress_time_copy;
+        if (time_delta >= 5 && atomic_compare_exchange_strong(&progress.time, &progress_time_copy, now)) {
+            uint64_t counter_copy = counter;
+            uint64_t count_delta = counter_copy - progress.count;
+
+            int speed = round((double)count_delta / (double)time_delta / 1000.);
+            printf("Speed = %dK keys per second\n", speed);
+
+            progress.count = counter_copy;
+        }
+
+        atomic_fetch_add(&counter, 1);
+#endif /* MEASURE_SPEED */
     }
 }
