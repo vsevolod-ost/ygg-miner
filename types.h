@@ -2,17 +2,15 @@
 
 #include <sodium.h>
 
-#define DEFTYPEOFSIZE(name, size) \
-    typedef struct {              \
-        uint8_t as_bytes[size];   \
-    } name
+typedef union {
+    uint8_t bytes[crypto_sign_PUBLICKEYBYTES];
+    uint64_t octets[crypto_sign_PUBLICKEYBYTES / sizeof(uint64_t)];
+} public_key_t;
 
-DEFTYPEOFSIZE(public_key_t, crypto_sign_PUBLICKEYBYTES);
-DEFTYPEOFSIZE(secret_key_t, crypto_sign_SECRETKEYBYTES);
-
-#undef DEFTYPEOFSIZE
-
-typedef struct {
-    public_key_t pk;
-    secret_key_t sk;
-} keypair_t;
+typedef union {
+    uint8_t bytes[crypto_sign_SECRETKEYBYTES];
+    struct {
+        uint8_t seed[crypto_sign_SEEDBYTES];
+        public_key_t pk;
+    } parts;
+} private_key_t;
