@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include <omp.h>
+#include <regex.h>
 #include <sodium.h>
 
 #include "config.h"
@@ -68,6 +69,8 @@ void keytoaddr(struct in6_addr* addr, public_key_t* key, int key_height)
     }
 }
 
+regex_t ip_pattern;
+
 void print_key_info(keypair_t* keypair, int height)
 {
     /* IP address */
@@ -75,6 +78,9 @@ void print_key_info(keypair_t* keypair, int height)
     keytoaddr(&addr, &keypair->pk, height);
     char addr_s[INET6_ADDRSTRLEN];
     inet_ntop(AF_INET6, &addr, addr_s, sizeof addr_s);
+
+    if (regexec(&ip_pattern, addr_s, 0, NULL, 0) == REG_NOMATCH)
+        return;
 
     /* Private key */
     char secret_key_hex[sizeof(secret_key_t) * 2 + 1];
@@ -96,6 +102,11 @@ int main(int argc, char* argv[])
     for (int opt; (opt = getopt(argc, argv, "a")) != -1;) {
         if (opt == 'a')
             option_print_all = true;
+    }
+
+    if (regcomp(&ip_pattern, "^.{30}$", REG_EXTENDED | REG_NOSUB) != 0) {
+        perror("Regex compilation failed");
+        return EXIT_FAILURE;
     }
 
     typedef _Atomic(time_t) atomic_time_t;
@@ -139,9 +150,7 @@ int main(int argc, char* argv[])
         }
 
 #if MEASURE_SPEED
-        time_t now = time(NULL),
-               progress_time_copy = progress.time,
-               time_delta = now - progress_time_copy;
+        time_t now = time(NULL), progress_time_copy = progress.time, time_delta = now - progress_time_copy;
         if (time_delta >= 5 && atomic_compare_exchange_strong(&progress.time, &progress_time_copy, now)) {
             uint64_t counter_copy = counter;
             uint64_t count_delta = counter_copy - progress.count;
