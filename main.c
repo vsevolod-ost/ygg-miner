@@ -3,11 +3,12 @@
 #include <bits/getopt_core.h>
 #include <math.h>
 #include <netinet/in.h>
-#include <signal.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <omp.h>
 #include <regex.h>
@@ -25,7 +26,13 @@ struct {
     regex_t regexpr;
 } globals;
 
-void handle_sigint(int sig) { exit(0); }
+void* flush_thread_run(void* args)
+{
+    for (;;) {
+        sleep(1);
+        fflush(stdout);
+    }
+}
 
 void gen_private_key(private_key_t* key)
 {
@@ -53,19 +60,6 @@ int get_leading_zero_bits(public_key_t* key)
     return bits_count;
 }
 
-bool check_height(private_key_t* key, atomic_int_fast16_t* best_height, int height)
-{
-    if (config.print_all)
-        return true;
-
-    for (int_fast16_t best_height_copy; height > (best_height_copy = *best_height);) {
-        if (atomic_compare_exchange_weak(best_height, &best_height_copy, height))
-            return true;
-    }
-
-    return false;
-}
-
 void keytoaddr(char addr_s[INET6_ADDRSTRLEN], public_key_t* key, int key_height)
 {
     int total_bit_offset = key_height + 1;
@@ -73,7 +67,7 @@ void keytoaddr(char addr_s[INET6_ADDRSTRLEN], public_key_t* key, int key_height)
     int bit_offset = total_bit_offset % 8;
 
     struct in6_addr addr;
-    uint8_t* addr_bytes = addr.__in6_u.__u6_addr8;
+    uint8_t* addr_bytes = addr.s6_addr;
     addr_bytes[0] = 2;
     addr_bytes[1] = key_height;
     for (size_t i = 2; i < sizeof(struct in6_addr); ++i) {
@@ -85,19 +79,6 @@ void keytoaddr(char addr_s[INET6_ADDRSTRLEN], public_key_t* key, int key_height)
     inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
 }
 
-void print_key_info(private_key_t* key, int height)
-{
-    /* IP address */
-    char addr_s[INET6_ADDRSTRLEN];
-    keytoaddr(addr_s, &key->parts.pk, height);
-
-    /* Private key */
-    char secret_key_hex[sizeof(private_key_t) * 2 + 1];
-    sodium_bin2hex(secret_key_hex, sizeof secret_key_hex, key->bytes, sizeof(private_key_t));
-
-    printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, secret_key_hex);
-}
-
 int main(int argc, char* argv[])
 {
     if (sodium_init() < 0) {
@@ -105,7 +86,10 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    signal(SIGINT, handle_sigint);
+    if (!isatty(STDOUT_FILENO)) {
+        pthread_t flush_thread_id;
+        pthread_create(&flush_thread_id, NULL, &flush_thread_run, NULL);
+    }
 
     for (int opt; (opt = getopt(argc, argv, "ag:")) != -1;) {
         switch (opt) {
@@ -131,36 +115,35 @@ int main(int argc, char* argv[])
     } progress = { time(NULL), counter };
 #endif /* MEASURE_SPEED */
 
-    atomic_time_t last_flush_time = 0;
     atomic_int_fast16_t best_height = -1;
 
-#pragma omp parallel for
-    for (uint64_t __i = 0; __i < UINT64_MAX; ++__i) {
+#pragma omp parallel
+    for (;;) {
         /* Generate keypair*/
         private_key_t key;
         gen_private_key(&key);
 
         /* Count height */
         const int height = get_leading_zero_bits(&key.parts.pk);
+        char addr_s[INET6_ADDRSTRLEN] = "";
 
         for (int_fast16_t best_height_copy; config.print_all || height > (best_height_copy = best_height);) {
-            char addr_s[INET6_ADDRSTRLEN];
-            keytoaddr(addr_s, &key.parts.pk, height);
+            if (!addr_s[0]) {
+                keytoaddr(addr_s, &key.parts.pk, height);
 
-            if (config.ip_pattern && regexec(&globals.regexpr, addr_s, 0, NULL, 0) == REG_NOMATCH)
-                break;
+                if (config.ip_pattern && regexec(&globals.regexpr, addr_s, 0, NULL, 0) != 0)
+                    break;
+            }
 
             if (config.print_all || atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
-                print_key_info(&key, height);
+                char private_key_hex[sizeof(private_key_t) * 2 + 1];
+                sodium_bin2hex(private_key_hex, sizeof private_key_hex, key.bytes, sizeof(private_key_t));
+
+                printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, private_key_hex);
                 break;
             }
-        }
 
-        {
-            time_t now = time(NULL), last_flush_time_copy = last_flush_time;
-            if (now - last_flush_time_copy >= 5
-                && atomic_compare_exchange_weak(&last_flush_time, &last_flush_time_copy, now))
-                fflush(stdout);
+            fprintf(stderr, "!!!Race!!!\n");
         }
 
 #if MEASURE_SPEED
@@ -168,11 +151,10 @@ int main(int argc, char* argv[])
         if (time_delta >= 5 && atomic_compare_exchange_strong(&progress.time, &progress_time_copy, now)) {
             uint64_t counter_copy = counter;
             uint64_t count_delta = counter_copy - progress.count;
-
             int speed = round((double)count_delta / (double)time_delta / 1000.);
-            fprintf(stderr, "Speed: %dK keys per second\n", speed);
-
             progress.count = counter_copy;
+
+            fprintf(stderr, "Speed: %d KH/s\n", speed);
         }
 
         atomic_fetch_add(&counter, 1);
