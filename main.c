@@ -7,6 +7,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,10 +21,13 @@ struct {
     bool print_all;
     char* ip_pattern;
     bool measure_speed;
+    char* brute_addr_s;
 } config;
 
 struct {
     regex_t regexpr;
+    struct in6_addr brute_addr;
+    size_t brute_bytes_count;
 } globals;
 
 void* flush_thread_run(void* args)
@@ -60,14 +64,13 @@ int get_leading_zero_bits(public_key_t* key)
     return bits_count;
 }
 
-void keytoaddr(char addr_s[INET6_ADDRSTRLEN], public_key_t* key, int key_height)
+void keytoaddr(struct in6_addr* addr, public_key_t* key, int key_height)
 {
     int total_bit_offset = key_height + 1;
     int byte_offset = total_bit_offset / 8;
     int bit_offset = total_bit_offset % 8;
 
-    struct in6_addr addr;
-    uint8_t* addr_bytes = addr.s6_addr;
+    uint8_t* addr_bytes = addr->s6_addr;
     addr_bytes[0] = 2;
     addr_bytes[1] = key_height;
     for (size_t i = 2; i < sizeof(struct in6_addr); ++i) {
@@ -75,8 +78,13 @@ void keytoaddr(char addr_s[INET6_ADDRSTRLEN], public_key_t* key, int key_height)
         addr_bytes[i] = (left_byte << bit_offset) | (right_byte >> (8 - bit_offset));
         ++byte_offset;
     }
+}
 
-    inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
+bool is_brute_target(struct in6_addr* addr)
+{
+    uint8_t* brute_bytes = globals.brute_addr.s6_addr;
+    uint8_t* addr_bytes = addr->s6_addr;
+    return memcmp(addr_bytes + 1, brute_bytes + 1, globals.brute_bytes_count) == 0;
 }
 
 void measure_speed(void)
@@ -113,7 +121,7 @@ int main(int argc, char* argv[])
         pthread_create(&flush_thread_id, NULL, &flush_thread_run, NULL);
     }
 
-    for (int opt; (opt = getopt(argc, argv, "ag:s")) != -1;) {
+    for (int opt; (opt = getopt(argc, argv, "ag:sb:")) != -1;) {
         switch (opt) {
         case 'a':
             config.print_all = true;
@@ -127,6 +135,23 @@ int main(int argc, char* argv[])
             break;
         case 's':
             config.measure_speed = true;
+            break;
+        case 'b':
+            config.brute_addr_s = optarg;
+            if (inet_pton(AF_INET6, config.brute_addr_s, &globals.brute_addr) != 1) {
+                perror("Invalid IP address\n");
+                return EXIT_FAILURE;
+            }
+            uint8_t first_byte = globals.brute_addr.s6_addr[0];
+            if (first_byte == 3)
+                globals.brute_bytes_count = 8 - 1;
+            else if (first_byte == 2)
+                globals.brute_bytes_count = 16 - 1;
+            else {
+                perror("Invalid IP address: first byte should be 2 or 3\n");
+                return EXIT_FAILURE;
+            }
+            config.print_all = true;
             break;
         }
     }
@@ -144,7 +169,13 @@ int main(int argc, char* argv[])
         char addr_s[INET6_ADDRSTRLEN] = "";
         for (int_fast16_t best_height_copy; config.print_all || height > (best_height_copy = best_height);) {
             if (!addr_s[0]) {
-                keytoaddr(addr_s, &key.parts.pk, height);
+                struct in6_addr addr;
+                keytoaddr(&addr, &key.parts.pk, height);
+
+                if (globals.brute_bytes_count && !is_brute_target(&addr))
+                    break;
+
+                inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
 
                 if (config.ip_pattern && regexec(&globals.regexpr, addr_s, 0, NULL, 0) != 0)
                     break;
