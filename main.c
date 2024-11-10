@@ -4,6 +4,7 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -17,14 +18,18 @@
 
 #include "types.h"
 
+#define SUBNET_SIZE 8
+#define MEASURE_SPEED_TIME 10
+
 struct {
     bool print_all;
-    char* ip_pattern;
+    char* regexpr_s;
     bool measure_speed;
     char* brute_addr_s;
 } config;
 
 struct {
+    bool shutdown;
     regex_t regexpr;
     struct in6_addr brute_addr;
     size_t brute_bytes_count;
@@ -36,6 +41,13 @@ void* flush_thread_run(void* args)
         sleep(1);
         fflush(stdout);
     }
+}
+
+void graceful_shutdown(int sig)
+{
+    if (globals.shutdown)
+        exit(EXIT_FAILURE);
+    globals.shutdown = true;
 }
 
 void gen_private_key(private_key_t* key)
@@ -98,7 +110,7 @@ void measure_speed(void)
 
     clock_t time_copy = measure_time, now = clock();
     double time_spent = (double)(now - time_copy) / (double)CLOCKS_PER_SEC / omp_get_num_threads();
-    if (time_spent > 10 && atomic_compare_exchange_strong(&measure_time, &time_copy, now)) {
+    if (time_spent >= 10 && atomic_compare_exchange_strong(&measure_time, &time_copy, now)) {
         uint64_t counter_copy;
         do {
             counter_copy = counter;
@@ -109,26 +121,70 @@ void measure_speed(void)
     }
 }
 
+void mine(void)
+{
+    atomic_int_fast16_t best_height = -1;
+#pragma omp parallel
+    while (!globals.shutdown) {
+        /* Generate keypair*/
+        private_key_t key;
+        gen_private_key(&key);
+
+        /* Count height */
+        const int height = get_leading_zero_bits(&key.parts.pk);
+
+        char addr_s[INET6_ADDRSTRLEN] = "";
+        /* Check height */
+        for (int_fast16_t best_height_copy; config.print_all || height > (best_height_copy = best_height);) {
+            if (!addr_s[0]) {
+                struct in6_addr addr;
+                keytoaddr(&addr, &key.parts.pk, height);
+
+                /* Bruteforce*/
+                if (globals.brute_bytes_count && !is_brute_target(&addr))
+                    break;
+
+                inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
+
+                /* Regex */
+                if (config.regexpr_s && regexec(&globals.regexpr, addr_s, 0, NULL, 0) != 0)
+                    break;
+            }
+
+            if (config.print_all || atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
+                char private_key_hex[sizeof(private_key_t) * 2 + 1];
+                sodium_bin2hex(private_key_hex, sizeof private_key_hex, key.bytes, sizeof(private_key_t));
+
+                /* Print IP address and private key */
+                printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, private_key_hex);
+                break;
+            }
+
+            /* Race */
+        }
+
+        if (config.measure_speed)
+            measure_speed();
+    }
+}
+
 int main(int argc, char* argv[])
 {
+    /* Initialize sodium library */
     if (sodium_init() < 0) {
         perror("Sodium library couldn't be initialized\n");
         return 1;
     }
 
-    if (!isatty(STDOUT_FILENO)) {
-        pthread_t flush_thread_id;
-        pthread_create(&flush_thread_id, NULL, &flush_thread_run, NULL);
-    }
-
+    /* Configure */
     for (int opt; (opt = getopt(argc, argv, "ag:sb:")) != -1;) {
         switch (opt) {
         case 'a':
             config.print_all = true;
             break;
         case 'g':
-            config.ip_pattern = optarg;
-            if (regcomp(&globals.regexpr, config.ip_pattern, REG_EXTENDED) != 0) {
+            config.regexpr_s = optarg;
+            if (regcomp(&globals.regexpr, config.regexpr_s, REG_EXTENDED) != 0) {
                 perror("Regex compilation failed\n");
                 return EXIT_FAILURE;
             }
@@ -144,9 +200,9 @@ int main(int argc, char* argv[])
             }
             uint8_t first_byte = globals.brute_addr.s6_addr[0];
             if (first_byte == 3)
-                globals.brute_bytes_count = 8 - 1;
+                globals.brute_bytes_count = SUBNET_SIZE - 1;
             else if (first_byte == 2)
-                globals.brute_bytes_count = 16 - 1;
+                globals.brute_bytes_count = sizeof(struct in6_addr) - 1;
             else {
                 perror("Invalid IP address: first byte should be 2 or 3\n");
                 return EXIT_FAILURE;
@@ -156,43 +212,14 @@ int main(int argc, char* argv[])
         }
     }
 
-    atomic_int_fast16_t best_height = -1;
-#pragma omp parallel
-    for (;;) {
-        /* Generate keypair*/
-        private_key_t key;
-        gen_private_key(&key);
-
-        /* Count height */
-        const int height = get_leading_zero_bits(&key.parts.pk);
-
-        char addr_s[INET6_ADDRSTRLEN] = "";
-        for (int_fast16_t best_height_copy; config.print_all || height > (best_height_copy = best_height);) {
-            if (!addr_s[0]) {
-                struct in6_addr addr;
-                keytoaddr(&addr, &key.parts.pk, height);
-
-                if (globals.brute_bytes_count && !is_brute_target(&addr))
-                    break;
-
-                inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
-
-                if (config.ip_pattern && regexec(&globals.regexpr, addr_s, 0, NULL, 0) != 0)
-                    break;
-            }
-
-            if (config.print_all || atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
-                char private_key_hex[sizeof(private_key_t) * 2 + 1];
-                sodium_bin2hex(private_key_hex, sizeof private_key_hex, key.bytes, sizeof(private_key_t));
-
-                printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, private_key_hex);
-                break;
-            }
-
-            /* Race */
-        }
-
-        if (config.measure_speed)
-            measure_speed();
+    /* If stdout is redirected to pipe, manual flush needed */
+    if (!isatty(STDOUT_FILENO)) {
+        pthread_t flush_thread_id;
+        pthread_create(&flush_thread_id, NULL, &flush_thread_run, NULL);
     }
+
+    signal(SIGINT, graceful_shutdown);
+
+    /* Start mine loop */
+    mine();
 }
