@@ -14,12 +14,12 @@
 #include <regex.h>
 #include <sodium.h>
 
-#include "config.h"
 #include "types.h"
 
 struct {
     bool print_all;
     char* ip_pattern;
+    bool measure_speed;
 } config;
 
 struct {
@@ -71,12 +71,34 @@ void keytoaddr(char addr_s[INET6_ADDRSTRLEN], public_key_t* key, int key_height)
     addr_bytes[0] = 2;
     addr_bytes[1] = key_height;
     for (size_t i = 2; i < sizeof(struct in6_addr); ++i) {
-        uint8_t cur_byte = ~key->bytes[byte_offset], next_byte = ~key->bytes[byte_offset + 1];
-        addr_bytes[i] = (cur_byte << bit_offset) | (next_byte >> (8 - bit_offset));
+        uint8_t left_byte = ~key->bytes[byte_offset], right_byte = ~key->bytes[byte_offset + 1];
+        addr_bytes[i] = (left_byte << bit_offset) | (right_byte >> (8 - bit_offset));
         ++byte_offset;
     }
 
     inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
+}
+
+void measure_speed(void)
+{
+    static atomic_uint_fast64_t counter;
+    atomic_fetch_add(&counter, 1);
+
+    static _Atomic(clock_t) measure_time;
+    if (!measure_time)
+        measure_time = clock();
+
+    clock_t time_copy = measure_time, now = clock();
+    double time_spent = (double)(now - time_copy) / (double)CLOCKS_PER_SEC / omp_get_num_threads();
+    if (time_spent > 10 && atomic_compare_exchange_strong(&measure_time, &time_copy, now)) {
+        uint64_t counter_copy;
+        do {
+            counter_copy = counter;
+        } while (!atomic_compare_exchange_weak(&counter, &counter_copy, 0));
+
+        uint64_t speed = round((counter_copy / time_spent) / 1000.);
+        fprintf(stderr, "Speed: %lu KH/s\n", speed);
+    }
 }
 
 int main(int argc, char* argv[])
@@ -91,7 +113,7 @@ int main(int argc, char* argv[])
         pthread_create(&flush_thread_id, NULL, &flush_thread_run, NULL);
     }
 
-    for (int opt; (opt = getopt(argc, argv, "ag:")) != -1;) {
+    for (int opt; (opt = getopt(argc, argv, "ag:s")) != -1;) {
         switch (opt) {
         case 'a':
             config.print_all = true;
@@ -103,20 +125,13 @@ int main(int argc, char* argv[])
                 return EXIT_FAILURE;
             }
             break;
+        case 's':
+            config.measure_speed = true;
+            break;
         }
     }
 
-    typedef _Atomic(time_t) atomic_time_t;
-#if MEASURE_SPEED
-    atomic_uint_fast64_t counter = 0;
-    struct {
-        atomic_time_t time;
-        uint64_t count;
-    } progress = { time(NULL), counter };
-#endif /* MEASURE_SPEED */
-
     atomic_int_fast16_t best_height = -1;
-
 #pragma omp parallel
     for (;;) {
         /* Generate keypair*/
@@ -125,8 +140,8 @@ int main(int argc, char* argv[])
 
         /* Count height */
         const int height = get_leading_zero_bits(&key.parts.pk);
-        char addr_s[INET6_ADDRSTRLEN] = "";
 
+        char addr_s[INET6_ADDRSTRLEN] = "";
         for (int_fast16_t best_height_copy; config.print_all || height > (best_height_copy = best_height);) {
             if (!addr_s[0]) {
                 keytoaddr(addr_s, &key.parts.pk, height);
@@ -143,21 +158,10 @@ int main(int argc, char* argv[])
                 break;
             }
 
-            fprintf(stderr, "!!!Race!!!\n");
+            /* Race */
         }
 
-#if MEASURE_SPEED
-        time_t now = time(NULL), progress_time_copy = progress.time, time_delta = now - progress_time_copy;
-        if (time_delta >= 5 && atomic_compare_exchange_strong(&progress.time, &progress_time_copy, now)) {
-            uint64_t counter_copy = counter;
-            uint64_t count_delta = counter_copy - progress.count;
-            int speed = round((double)count_delta / (double)time_delta / 1000.);
-            progress.count = counter_copy;
-
-            fprintf(stderr, "Speed: %d KH/s\n", speed);
-        }
-
-        atomic_fetch_add(&counter, 1);
-#endif /* MEASURE_SPEED */
+        if (config.measure_speed)
+            measure_speed();
     }
 }

@@ -1,1 +1,0 @@
-#define MEASURE_SPEED 1
