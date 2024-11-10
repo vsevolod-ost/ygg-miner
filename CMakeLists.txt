@@ -6,3 +6,7 @@ set(CMAKE_C_COMPILER "clang")
 add_executable(ygg-miner main.c)
 target_compile_options(ygg-miner PUBLIC -xc -std=c17 -fopenmp -Ofast -march=native)
 target_link_options(ygg-miner PUBLIC -flto=full -Ofast -s -fopenmp -lsodium -lm -lpthread  -march=native)
+
+add_executable(ygg-miner-debug main.c)
+target_compile_options(ygg-miner-debug PUBLIC -xc -std=c17 -Wall -pedantic -fopenmp)
+target_link_options(ygg-miner-debug PUBLIC -Wall -pedantic -fopenmp -lsodium -lm -lpthread)

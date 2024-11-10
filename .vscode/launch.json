@@ -8,8 +8,8 @@
             "type": "lldb",
             "request": "launch",
             "name": "Debug",
-            "program": "${workspaceFolder}/build/ygg-miner",
-            "args": [],
+            "program": "${workspaceFolder}/build/ygg-miner-debug",
+            "args": ["-s"],
             "cwd": "${workspaceFolder}/build",
             "preLaunchTask": "build"
         }
