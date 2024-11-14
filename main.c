@@ -26,6 +26,8 @@ struct {
     char* regexpr_s;
     bool measure_speed;
     char* brute_addr_s;
+    bool subnet;
+    bool length;
 } config;
 
 struct {
@@ -92,6 +94,14 @@ void keytoaddr(struct in6_addr* addr, public_key_t* key, int key_height)
     }
 }
 
+void addr_to_subnet(struct in6_addr* sub_addr, struct in6_addr* addr)
+{
+    uint8_t *sub_addr_bytes = sub_addr->s6_addr, *addr_bytes = addr->s6_addr;
+    sub_addr_bytes[0] = 3;
+    memcpy(sub_addr_bytes + 1, addr_bytes + 1, 8 - 1);
+    memset(sub_addr_bytes + 8, 0, 8);
+}
+
 bool is_brute_target(struct in6_addr* addr)
 {
     uint8_t* brute_bytes = globals.brute_addr.s6_addr;
@@ -102,19 +112,19 @@ bool is_brute_target(struct in6_addr* addr)
 void measure_speed(void)
 {
     static atomic_uint_fast64_t counter;
-    atomic_fetch_add(&counter, 1);
+    ++counter;
 
-    static _Atomic(clock_t) measure_time;
-    if (!measure_time)
-        measure_time = clock();
+    static _Atomic clock_t last_time;
+    if (!last_time)
+        last_time = clock();
 
-    clock_t time_copy = measure_time, now = clock();
-    double time_spent = (double)(now - time_copy) / (double)CLOCKS_PER_SEC / omp_get_num_threads();
-    if (time_spent >= 10 && atomic_compare_exchange_strong(&measure_time, &time_copy, now)) {
+    clock_t last_time_copy = last_time, now = clock();
+    double time_spent = (double)(now - last_time_copy) / (double)CLOCKS_PER_SEC / omp_get_num_threads();
+    if (time_spent >= 10 && atomic_compare_exchange_weak(&last_time, &last_time_copy, now)) {
         uint64_t counter_copy;
-        do {
+        do
             counter_copy = counter;
-        } while (!atomic_compare_exchange_weak(&counter, &counter_copy, 0));
+        while (!atomic_compare_exchange_weak(&counter, &counter_copy, 0));
 
         uint64_t speed = round((counter_copy / time_spent) / 1000.);
         fprintf(stderr, "Speed: %lu KH/s\n", speed);
@@ -124,6 +134,7 @@ void measure_speed(void)
 void mine(void)
 {
     atomic_int_fast16_t best_height = -1;
+    atomic_uint_fast8_t best_length = INET6_ADDRSTRLEN;
 #pragma omp parallel
     while (!globals.shutdown) {
         /* Generate keypair*/
@@ -133,34 +144,60 @@ void mine(void)
         /* Count height */
         const int height = get_leading_zero_bits(&key.parts.pk);
 
-        char addr_s[INET6_ADDRSTRLEN] = "";
-        /* Check height */
-        for (int_fast16_t best_height_copy; config.print_all || height > (best_height_copy = best_height);) {
-            if (!addr_s[0]) {
-                struct in6_addr addr;
-                keytoaddr(&addr, &key.parts.pk, height);
+        if (config.print_all || config.length || height > best_height) {
+            char addr_s[INET6_ADDRSTRLEN] = "";
+            size_t length;
+            for (;;) {
+                if (!addr_s[0]) {
+                    struct in6_addr addr;
+                    keytoaddr(&addr, &key.parts.pk, height);
+                    if (config.subnet)
+                        addr_to_subnet(&addr, &addr);
 
-                /* Bruteforce*/
-                if (globals.brute_bytes_count && !is_brute_target(&addr))
-                    break;
+                    /* Bruteforce*/
+                    if (globals.brute_bytes_count && !is_brute_target(&addr))
+                        break;
 
-                inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
+                    inet_ntop(AF_INET6, &addr, addr_s, INET6_ADDRSTRLEN);
 
-                /* Regex */
-                if (config.regexpr_s && regexec(&globals.regexpr, addr_s, 0, NULL, 0) != 0)
-                    break;
-            }
+                    /* Regex */
+                    if (config.regexpr_s && regexec(&globals.regexpr, addr_s, 0, NULL, 0) != 0)
+                        break;
 
-            if (config.print_all || atomic_compare_exchange_weak(&best_height, &best_height_copy, height)) {
+                    /* Length */
+                    if (config.length)
+                        length = strlen(addr_s);
+                }
+
+                if (config.length) {
+                    uint_fast8_t best_length_copy;
+                    if (length > (best_length_copy = best_length))
+                        break;
+
+                    if (length < best_length_copy) {
+                        if (!atomic_compare_exchange_weak(&best_length, &best_length_copy, length))
+                            continue;
+                        best_height = -1;
+                    }
+                }
+
+                if (!config.print_all) {
+                    int_fast16_t best_height_copy;
+                    if (height <= (best_height_copy = best_height))
+                        break;
+
+                    if (!atomic_compare_exchange_weak(&best_height, &best_height_copy, height))
+                        continue;
+                }
+
                 char private_key_hex[sizeof(private_key_t) * 2 + 1];
                 sodium_bin2hex(private_key_hex, sizeof private_key_hex, key.bytes, sizeof(private_key_t));
 
                 /* Print IP address and private key */
-                printf("# IPv6 address: %s\nPrivateKey: %s\n", addr_s, private_key_hex);
+                const char* id_name = config.subnet ? "IPv6 subnet" : "IPv6 address";
+                printf("# %s: %s\nPrivateKey: %s\n", id_name, addr_s, private_key_hex);
                 break;
             }
-
-            /* Race */
         }
 
         if (config.measure_speed)
@@ -177,7 +214,7 @@ int main(int argc, char* argv[])
     }
 
     /* Configure */
-    for (int opt; (opt = getopt(argc, argv, "ag:sb:")) != -1;) {
+    for (int opt; (opt = getopt(argc, argv, "as3lg:b:")) != -1;) {
         switch (opt) {
         case 'a':
             config.print_all = true;
@@ -209,6 +246,14 @@ int main(int argc, char* argv[])
             }
             config.print_all = true;
             break;
+        case '3':
+            config.subnet = true;
+            break;
+        case 'l':
+            config.length = true;
+            break;
+        default:
+            return EXIT_FAILURE;
         }
     }
 
