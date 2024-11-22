@@ -1,15 +1,12 @@
 #include <arpa/inet.h>
-#include <assert.h>
 #include <bits/getopt_core.h>
 #include <math.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include <omp.h>
@@ -28,6 +25,7 @@ struct {
     char* brute_addr_s;
     bool subnet;
     bool length;
+    size_t threads;
 } config;
 
 struct {
@@ -214,7 +212,7 @@ int main(int argc, char* argv[])
     }
 
     /* Configure */
-    for (int opt; (opt = getopt(argc, argv, "as3lg:b:")) != -1;) {
+    for (int opt; (opt = getopt(argc, argv, "as3lg:b:t:")) != -1;) {
         switch (opt) {
         case 'a':
             config.print_all = true;
@@ -252,6 +250,9 @@ int main(int argc, char* argv[])
         case 'l':
             config.length = true;
             break;
+        case 't':
+            config.threads = atoi(optarg);
+            break;
         default:
             return EXIT_FAILURE;
         }
@@ -264,6 +265,9 @@ int main(int argc, char* argv[])
     }
 
     signal(SIGINT, graceful_shutdown);
+
+    if (config.threads)
+        omp_set_num_threads(config.threads);
 
     /* Start mine loop */
     mine();
