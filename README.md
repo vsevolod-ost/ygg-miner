@@ -55,7 +55,6 @@ tail -1 keys.tsv | cut -f2 | sed 's/^/PrivateKey: /'   # line for yggdrasil.conf
   immediately. The exit status is that of the signal (130 for Ctrl+C), and a
   closed pipe (`| head -1`) ends it via `SIGPIPE`.
 
-## History
+## License
 
-Experiments that did not make it into `main` (lock-free collections, an output
-thread on C11 threads, an OpenCL draft) are kept as `archive/*` tags.
+[MIT](LICENSE)
