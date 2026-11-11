@@ -1,0 +1,9 @@
+BasedOnStyle: LLVM
+Language:        Cpp
+IndentWidth: 8
+UseTab: Always
+ColumnLimit:     120
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+IndentCaseLabels: false
+AllowShortFunctionsOnASingleLine: true

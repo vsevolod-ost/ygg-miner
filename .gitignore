@@ -54,7 +54,7 @@ compile_commands.json
 CTestTestfile.cmake
 _deps
 CMakeUserPresets.json
-/build
+/build*/
 
 .vscode/*
 !.vscode/settings.json
@@ -70,5 +70,4 @@ CMakeUserPresets.json
 *.vsix
 
 # clang
-/.clang-format
 /.cache
