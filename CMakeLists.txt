@@ -10,7 +10,6 @@ option(YGG_MINER_NATIVE "Optimize for the host CPU (-march=native)" OFF)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
 find_package(OpenMP REQUIRED COMPONENTS C)
-find_package(Threads REQUIRED)
 
 add_executable(ygg-miner main.c)
 set_target_properties(ygg-miner PROPERTIES
@@ -21,7 +20,7 @@ target_compile_options(ygg-miner PRIVATE -Wall -Wextra -Wpedantic)
 if(YGG_MINER_NATIVE)
 	target_compile_options(ygg-miner PRIVATE -march=native)
 endif()
-target_link_libraries(ygg-miner PRIVATE PkgConfig::SODIUM OpenMP::OpenMP_C Threads::Threads m)
+target_link_libraries(ygg-miner PRIVATE PkgConfig::SODIUM OpenMP::OpenMP_C m)
 
 include(CheckIPOSupported)
 check_ipo_supported(RESULT ipo_supported LANGUAGES C)

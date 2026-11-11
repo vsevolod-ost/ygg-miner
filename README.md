@@ -21,36 +21,39 @@ cmake --build build
 ## Usage
 
 ```
-ygg-miner [options]
+ygg-miner [-a] [-3] [-l] [-g REGEX]
 
-  -a          print every key passing the filters, not only improvements
-  -3          work with /64 subnets (300::/8) instead of addresses
-  -l          prefer the shortest address text, then the highest one
-  -g REGEX    print only addresses matching the POSIX extended REGEX
-  -b ADDR     look for the key of exactly this address (2xx::) or subnet (3xx::); implies -a
-  -t THREADS  number of mining threads (default: all CPUs)
-  -s          report the mining speed to stderr every 10 seconds
-  -h          show this help
+  -a        print every key passing the filters, not only improvements
+  -3        work with /64 subnets (300::/8) instead of addresses
+  -l        prefer the shortest address text, then the highest one
+  -g REGEX  print only addresses matching the POSIX extended REGEX
+  -h        show this help
 ```
 
-Every found key is printed as two lines, ready to paste into `yggdrasil.conf`:
+Every found key is one line: the address (or subnet), a tab, and the private
+key in hex. Keep the output private: it contains private keys.
 
 ```
-# IPv6 address: 200:c2ac:65bb:43c4:78d0:4e73:809d:ffad
-PrivateKey: c24e8667...
+200:c2ac:65bb:43c4:78d0:4e73:809d:ffad	c24e8667...
 ```
 
-Examples:
+It is meant to be combined with the usual tools:
 
 ```sh
-ygg-miner -s | tee keys.txt              # highest addresses, with speed reports
-ygg-miner -3                             # highest /64 subnets
-ygg-miner -l                             # shortest addresses
-ygg-miner -a -g ':(cafe|beef):'          # every address with a word in it
+ygg-miner | tee keys.tsv                     # highest addresses as they are found
+ygg-miner -3                                 # highest /64 subnets
+ygg-miner -l                                 # shortest addresses
+ygg-miner -a | grep -m1 ':cafe:'             # first address with a word in it
+ygg-miner -a -g ':cafe:' | head -1           # the same, filtered inside the miner (faster)
+tail -1 keys.tsv | cut -f2 | sed 's/^/PrivateKey: /'   # line for yggdrasil.conf
 ```
 
-Stop it with Ctrl+C; a second Ctrl+C exits immediately. Keep the output
-private: it contains private keys.
+- Threads: `OMP_NUM_THREADS=4 ygg-miner` (default: all CPUs).
+- Statistics: `pkill -USR1 ygg-miner` prints the key count, speed and the best
+  result so far to stderr.
+- `SIGINT`/`SIGTERM` stop it after the current batch, a second one exits
+  immediately. The exit status is that of the signal (130 for Ctrl+C), and a
+  closed pipe (`| head -1`) ends it via `SIGPIPE`.
 
 ## History
 

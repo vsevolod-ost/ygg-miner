@@ -1,6 +1,7 @@
 /*
  * ygg-miner: searches for Yggdrasil keys whose IPv6 address (or /64 subnet)
  * is "better" than the ones found so far: higher, shorter or matching a pattern.
+ * Prints one key per line: "<address>\t<private key>".
  */
 
 /* be64toh, clock_gettime, getopt */
@@ -8,10 +9,9 @@
 
 #include <arpa/inet.h>
 #include <endian.h>
-#include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdbit.h>
@@ -31,40 +31,44 @@
 
 /* Yggdrasil subnet prefix length in bytes (300::/8 + 56 bits of the key = /64) */
 #define SUBNET_SIZE 8
-/* Interval of speed reports, seconds */
-#define MEASURE_SPEED_TIME 10
-/* Keys a mining thread generates before publishing its count to the speed counter */
-#define SPEED_COUNTER_BATCH 256
+/* Keys a mining thread generates between checks of statistics requests and publishing its key count */
+#define BATCH_SIZE 256
 
 static struct {
 	bool print_all;
 	char const *regexpr_s;
-	bool measure_speed;
 	bool subnet;
 	bool length;
-	int threads;
 } config;
 
 static struct {
 	regex_t regexpr;
-	struct in6_addr brute_addr;
-	size_t brute_bytes_count;
+	struct timespec start_time;
 
-	/* Written only in the "best" critical section; read outside it for the cheap rejection */
+	/* Written only in the "best" critical section; read outside it for the cheap rejection and statistics */
 	atomic_int best_height;
-	int best_length;
+	atomic_int best_length;
 	atomic_uint_fast64_t keys_generated;
 } globals;
 
-static volatile sig_atomic_t shutdown_requested;
+/* Set from signal handlers: lock-free atomics are async-signal-safe */
+static atomic_int shutdown_signal;
+static atomic_bool stats_requested;
+static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_BOOL_LOCK_FREE == 2, "signal flags must be lock-free");
 
-static void graceful_shutdown(int sig)
+static void handle_shutdown(int sig)
+{
+	/* Second signal terminates immediately */
+	if (atomic_exchange(&shutdown_signal, sig)) {
+		signal(sig, SIG_DFL);
+		raise(sig);
+	}
+}
+
+static void handle_stats(int sig)
 {
 	(void)sig;
-	/* Second Ctrl+C terminates immediately */
-	if (shutdown_requested)
-		_exit(EXIT_FAILURE);
-	shutdown_requested = 1;
+	atomic_store(&stats_requested, true);
 }
 
 static void gen_private_key(private_key_t *key)
@@ -116,33 +120,25 @@ static void addr_to_subnet(struct in6_addr *addr)
 	memset(addr->s6_addr + SUBNET_SIZE, 0, sizeof addr->s6_addr - SUBNET_SIZE);
 }
 
-static bool is_brute_target(struct in6_addr const *addr)
+static void print_stats(void)
 {
-	/* The first byte (0x02 / 0x03) only tells an address from a subnet */
-	return memcmp(addr->s6_addr + 1, globals.brute_addr.s6_addr + 1, globals.brute_bytes_count) == 0;
-}
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	double const elapsed =
+	    (now.tv_sec - globals.start_time.tv_sec) + (now.tv_nsec - globals.start_time.tv_nsec) / 1e9;
+	uint64_t const keys = atomic_load_explicit(&globals.keys_generated, memory_order_relaxed);
 
-static void *speed_thread_run(void *arg)
-{
-	(void)arg;
-	struct timespec last;
-	clock_gettime(CLOCK_MONOTONIC, &last);
-
-	while (!shutdown_requested) {
-		sleep(MEASURE_SPEED_TIME);
-		/* sleep() is cut short by the shutdown signal: don't report a partial interval */
-		if (shutdown_requested)
-			break;
-
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		uint64_t const keys = atomic_exchange_explicit(&globals.keys_generated, 0, memory_order_relaxed);
-		double const elapsed = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
-		last = now;
-
-		fprintf(stderr, "Speed: %ld KH/s\n", lround(keys / elapsed / 1000));
+	char best[64] = "";
+	if (config.length)
+		snprintf(best, sizeof best, ", best length %d",
+			 atomic_load_explicit(&globals.best_length, memory_order_relaxed));
+	if (!config.print_all) {
+		size_t const used = strlen(best);
+		snprintf(best + used, sizeof best - used, ", best height %d",
+			 atomic_load_explicit(&globals.best_height, memory_order_relaxed));
 	}
-	return NULL;
+
+	fprintf(stderr, "%" PRIu64 " keys in %.0f s, %ld KH/s%s\n", keys, elapsed, lround(keys / elapsed / 1000), best);
 }
 
 /*
@@ -153,10 +149,11 @@ static void *speed_thread_run(void *arg)
 static bool update_best(int length, int height)
 {
 	if (config.length) {
-		if (length > globals.best_length)
+		int const best_length = atomic_load_explicit(&globals.best_length, memory_order_relaxed);
+		if (length > best_length)
 			return false;
-		if (length < globals.best_length) {
-			globals.best_length = length;
+		if (length < best_length) {
+			atomic_store_explicit(&globals.best_length, length, memory_order_relaxed);
 			atomic_store_explicit(&globals.best_height, -1, memory_order_relaxed);
 		}
 	}
@@ -184,9 +181,6 @@ static void try_key(private_key_t const *key)
 	if (config.subnet)
 		addr_to_subnet(&addr);
 
-	if (globals.brute_bytes_count && !is_brute_target(&addr))
-		return;
-
 	char addr_s[INET6_ADDRSTRLEN];
 	inet_ntop(AF_INET6, &addr, addr_s, sizeof addr_s);
 
@@ -199,8 +193,7 @@ static void try_key(private_key_t const *key)
 	/* Updating the best key and printing it in one critical section keeps the output in order of improvement */
 #pragma omp critical(best)
 	if (update_best(strlen(addr_s), height))
-		printf("# %s: %s\nPrivateKey: %s\n", config.subnet ? "IPv6 subnet" : "IPv6 address", addr_s,
-		       private_key_hex);
+		printf("%s\t%s\n", addr_s, private_key_hex);
 
 	sodium_memzero(private_key_hex, sizeof private_key_hex);
 }
@@ -210,16 +203,17 @@ static void mine(void)
 #pragma omp parallel
 	{
 		private_key_t key;
-		unsigned batch = 0;
 
-		while (!shutdown_requested) {
-			gen_private_key(&key);
-			try_key(&key);
-
-			if (config.measure_speed && ++batch == SPEED_COUNTER_BATCH) {
-				atomic_fetch_add_explicit(&globals.keys_generated, batch, memory_order_relaxed);
-				batch = 0;
+		while (!atomic_load_explicit(&shutdown_signal, memory_order_relaxed)) {
+			for (unsigned i = 0; i < BATCH_SIZE; ++i) {
+				gen_private_key(&key);
+				try_key(&key);
 			}
+			atomic_fetch_add_explicit(&globals.keys_generated, BATCH_SIZE, memory_order_relaxed);
+
+			if (atomic_load_explicit(&stats_requested, memory_order_relaxed) &&
+			    atomic_exchange(&stats_requested, false))
+				print_stats();
 		}
 
 		sodium_memzero(&key, sizeof key);
@@ -229,63 +223,24 @@ static void mine(void)
 static void print_usage(FILE *stream, char const *program)
 {
 	fprintf(stream,
-		"Usage: %s [options]\n"
-		"Mine Yggdrasil keys and print every key that beats the best one found so far.\n"
+		"Usage: %s [-a] [-3] [-l] [-g REGEX]\n"
+		"Mine Yggdrasil keys and print every key that beats the best one found so far,\n"
+		"one per line: <address> TAB <private key>.\n"
 		"\n"
-		"Options:\n"
-		"  -a          print every key passing the filters, not only improvements\n"
-		"  -3          work with /64 subnets (300::/8) instead of addresses\n"
-		"  -l          prefer the shortest address text, then the highest one\n"
-		"  -g REGEX    print only addresses matching the POSIX extended REGEX\n"
-		"  -b ADDR     look for the key of exactly this address (2xx::) or subnet (3xx::); implies -a\n"
-		"  -t THREADS  number of mining threads (default: all CPUs)\n"
-		"  -s          report the mining speed to stderr every %d seconds\n"
-		"  -h          show this help\n"
+		"  -a        print every key passing the filters, not only improvements\n"
+		"  -3        work with /64 subnets (300::/8) instead of addresses\n"
+		"  -l        prefer the shortest address text, then the highest one\n"
+		"  -g REGEX  print only addresses matching the POSIX extended REGEX\n"
+		"  -h        show this help\n"
 		"\n"
-		"Stop with Ctrl+C; press it twice to exit immediately.\n",
-		program, MEASURE_SPEED_TIME);
-}
-
-static bool parse_brute_addr(char const *addr_s)
-{
-	if (inet_pton(AF_INET6, addr_s, &globals.brute_addr) != 1) {
-		fprintf(stderr, "Invalid IPv6 address: %s\n", addr_s);
-		return false;
-	}
-
-	switch (globals.brute_addr.s6_addr[0]) {
-	case 2:
-		globals.brute_bytes_count = sizeof globals.brute_addr.s6_addr - 1;
-		break;
-	case 3:
-		globals.brute_bytes_count = SUBNET_SIZE - 1;
-		config.subnet = true;
-		break;
-	default:
-		fprintf(stderr, "Invalid Yggdrasil address %s: it should start with 2xx: or 3xx:\n", addr_s);
-		return false;
-	}
-
-	config.print_all = true;
-	return true;
-}
-
-static bool parse_threads(char const *threads_s)
-{
-	char *end;
-	errno = 0;
-	long const threads = strtol(threads_s, &end, 10);
-	if (errno || end == threads_s || *end || threads < 1 || threads > INT_MAX) {
-		fprintf(stderr, "Invalid threads count: %s\n", threads_s);
-		return false;
-	}
-	config.threads = threads;
-	return true;
+		"Threads: OMP_NUM_THREADS (default: all CPUs). Statistics: send SIGUSR1.\n"
+		"Stops on SIGINT/SIGTERM, a second one exits immediately.\n",
+		program);
 }
 
 int main(int argc, char *argv[])
 {
-	for (int opt; (opt = getopt(argc, argv, "as3lg:b:t:h")) != -1;) {
+	for (int opt; (opt = getopt(argc, argv, "a3lg:h")) != -1;) {
 		switch (opt) {
 		case 'a':
 			config.print_all = true;
@@ -297,22 +252,11 @@ int main(int argc, char *argv[])
 				return EXIT_FAILURE;
 			}
 			break;
-		case 's':
-			config.measure_speed = true;
-			break;
-		case 'b':
-			if (!parse_brute_addr(optarg))
-				return EXIT_FAILURE;
-			break;
 		case '3':
 			config.subnet = true;
 			break;
 		case 'l':
 			config.length = true;
-			break;
-		case 't':
-			if (!parse_threads(optarg))
-				return EXIT_FAILURE;
 			break;
 		case 'h':
 			print_usage(stdout, argv[0]);
@@ -333,32 +277,38 @@ int main(int argc, char *argv[])
 		return EXIT_FAILURE;
 	}
 
-	struct sigaction sa = {.sa_handler = graceful_shutdown};
+	struct sigaction sa = {.sa_handler = handle_shutdown};
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	sa.sa_handler = handle_stats;
+	sa.sa_flags = SA_RESTART;
+	sigaction(SIGUSR1, &sa, NULL);
+
+	/* The mask is inherited from the parent, which may block these; threads created later inherit ours */
+	sigset_t handled;
+	sigemptyset(&handled);
+	sigaddset(&handled, SIGINT);
+	sigaddset(&handled, SIGTERM);
+	sigaddset(&handled, SIGUSR1);
+	sigprocmask(SIG_UNBLOCK, &handled, NULL);
 
 	/* Found keys are rare: flush every record even when stdout is a pipe or a file */
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	atomic_init(&globals.best_height, -1);
-	globals.best_length = INET6_ADDRSTRLEN;
-
-	if (config.measure_speed) {
-		pthread_t speed_thread;
-		if (pthread_create(&speed_thread, NULL, speed_thread_run, NULL) != 0) {
-			fprintf(stderr, "Couldn't start the speed measuring thread\n");
-			return EXIT_FAILURE;
-		}
-		pthread_detach(speed_thread);
-	}
-
-	if (config.threads)
-		omp_set_num_threads(config.threads);
+	atomic_init(&globals.best_length, INET6_ADDRSTRLEN);
+	clock_gettime(CLOCK_MONOTONIC, &globals.start_time);
 
 	mine();
 
 	if (config.regexpr_s)
 		regfree(&globals.regexpr);
-	return EXIT_SUCCESS;
+
+	/* Die by the signal that stopped us, so the caller sees the conventional status (130 for Ctrl+C) */
+	int const sig = atomic_load(&shutdown_signal);
+	fflush(stdout);
+	signal(sig, SIG_DFL);
+	raise(sig);
+	return EXIT_FAILURE;
 }
